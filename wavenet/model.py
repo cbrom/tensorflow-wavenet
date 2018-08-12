@@ -639,6 +639,7 @@ class WaveNetModel(object):
 
             # Cut off the last sample of network input to preserve causality.
             network_input_width = tf.shape(network_input)[1] - 1
+            network_input_before = network_input
             network_input = tf.slice(network_input, [0, 0, 0],
                                      [-1, network_input_width, -1])
 
@@ -649,12 +650,12 @@ class WaveNetModel(object):
                 # for the first predicted sample.
                 target_output = tf.slice(
                     tf.reshape(
-                        encoded,
-                        [self.batch_size, -1, self.quantization_channels]),
+                        network_input_before,
+                        [self.batch_size, -1, 1]),
                     [0, self.receptive_field, 0],
                     [-1, -1, -1])
                 target_output = tf.reshape(target_output,
-                                           [-1, self.quantization_channels])
+                                           [-1])
                 prediction = tf.reshape(raw_output,
                                         [-1, self.quantization_channels])
 
@@ -742,21 +743,22 @@ class WaveNetModel(object):
         return x - m - tf.log(tf.reduce_sum(tf.exp(x - m), axis, keepdims=True))
 
     def discretized_mix_logistic_loss(self, x, l, sum_all=True):
-        # xs = self.int_shape(x)  # original audio [n, 100000]
-        # ls = self.int_shape(l)  # generated audio [n, 100000, 256]
-        print(len(self.int_shape(l)))
+        # xs = self.int_shape(x)  # original audio [n*100000]
+        # ls = self.int_shape(l)  # generated audio [n*100000, 256]
         xs = tf.shape(x)
         ls = tf.shape(l)
 
-        print("xs=====================================================", xs)
-        print("ls=====================================================", ls)
+        print("xs=====================================================", self.int_shape(x))
+        print("ls=====================================================", self.int_shape(l))
 
         nr_mix = int(self.int_shape(l)[-1] / 3)
-        logit_probs = l[:, :, :nr_mix]
-        l = l[:, :, nr_mix:]
-        means = l[:, :, :nr_mix]
-        log_scales = tf.maximum(l[:, :, nr_mix: 2 * nr_mix], -7.)
-        x = tf.reshape(x, [xs[0], xs[1]] + [1]) + tf.zeros([xs[0], xs[1]] + [nr_mix])
+        logit_probs = l[:, :nr_mix]
+        l = l[:, nr_mix:]
+        means = l[:, :nr_mix]
+        log_scales = tf.maximum(l[:, nr_mix: 2 * nr_mix], -7.)
+        x = tf.reshape(x, [xs[0] ] + [1]) + tf.zeros([xs[0]] + [nr_mix])
+
+        print('x shape in discretized_mix_logistic_loss:', self.int_shape(x))
 
         centered_x = x - means
         inv_stdv = tf.exp(-log_scales)
@@ -771,11 +773,6 @@ class WaveNetModel(object):
         mid_in = inv_stdv * centered_x
         log_pdf_mid = mid_in - log_scales - 2. * tf.nn.softplus(mid_in)
 
-        print('cdf_delta:')
-        print('log_cdf_plus:')
-        print('log_one_minus_cdf_min:')
-        print('log_pdf_mid:')
-
         log_probs = tf.where(x < -0.999, log_cdf_plus,
                              tf.where(x > 0.999, log_one_minus_cdf_min,
                                       tf.where(cdf_delta > 1e-5,
@@ -785,7 +782,7 @@ class WaveNetModel(object):
 
         print("log_probs shape in model.py:", self.int_shape(log_probs))
 
-        log_probs = tf.reduce_sum(log_probs, 1) + self.log_prob_from_logits(logit_probs)
+        log_probs = tf.reduce_sum(log_probs, 0) + self.log_prob_from_logits(logit_probs)
         if sum_all:
             return -tf.reduce_sum(self.log_sum_exp(log_probs))
 
@@ -793,8 +790,9 @@ class WaveNetModel(object):
         """ a network in network layer (1x1 CONV) """
         v = x
         s = self.int_shape(x)
-        print("x shape in nin is:", x.get_shape())
         # s = x.get_shape()
         x = tf.reshape(x, [tf.shape(x)[0], s[-1]])
         x = self.dense(x, num_units, **kwargs)
-        return tf.reshape(x, [tf.shape(v)[0], 256, num_units])
+
+        print("x shape in nin is:", x.get_shape())
+        return tf.reshape(x, [-1, num_units])
