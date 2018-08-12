@@ -657,9 +657,15 @@ class WaveNetModel(object):
                                            [-1, self.quantization_channels])
                 prediction = tf.reshape(raw_output,
                                         [-1, self.quantization_channels])
-                loss = tf.nn.softmax_cross_entropy_with_logits(
-                    logits=prediction,
-                    labels=target_output)
+
+                # first get the dense network
+                prediction = self.nin(prediction, 10 * 3)
+                print("nin output shape:", prediction.get_shape())
+                # then loss function
+                loss = self.discretized_mix_logistic_loss(target_output, prediction)
+                # loss = tf.nn.softmax_cross_entropy_with_logits(
+                #     logits=prediction,
+                #     labels=target_output)
                 reduced_loss = tf.reduce_mean(loss)
 
                 tf.summary.scalar('loss', reduced_loss)
@@ -680,3 +686,115 @@ class WaveNetModel(object):
                     tf.summary.scalar('total_loss', total_loss)
 
                     return total_loss
+
+    def int_shape(self, x):
+        return list(map(lambda val:val.value if val.value != None else -1, x.get_shape()))
+
+    def get_var_maybe_avg(self, var_name, ema, **kwargs):
+        ''' utility for retrieving polyak averaged params '''
+        v = tf.get_variable(var_name, **kwargs)
+        if ema is not None:
+            v = ema.average(v)
+        return v
+
+
+    def dense(self, x, num_units, nonlinearity=None, init_scale=1., counters={}, init=False, ema=None, **kwargs):
+        ''' fully connected layer '''
+        name = 'dense'
+        with tf.variable_scope(name):
+            V = self.get_var_maybe_avg('V', ema, shape=[int(x.get_shape()[1]), num_units], dtype=tf.float32,
+                                  initializer=tf.random_normal_initializer(0, 0.05), trainable=True)
+            g = self.get_var_maybe_avg('g', ema, shape=[num_units], dtype=tf.float32,
+                                  initializer=tf.constant_initializer(1.), trainable=True)
+            b = self.get_var_maybe_avg('b', ema, shape=[num_units], dtype=tf.float32,
+                                  initializer=tf.constant_initializer(0.), trainable=True)
+
+            # use weight normalization (Salimans & Kingma, 2016)
+            print('x is:', x)
+            print('V is:', V)
+            x = tf.matmul(x, V)
+            scaler = g / tf.sqrt(tf.reduce_sum(tf.square(V), [0]))
+            x = tf.reshape(scaler, [1, num_units]) * x + tf.reshape(b, [1, num_units])
+
+            if init:  # normalize x
+                m_init, v_init = tf.nn.moments(x, [0])
+                scale_init = init_scale / tf.sqrt(v_init + 1e-10)
+                with tf.control_dependencies([g.assign(g * scale_init), b.assign_add(-m_init * scale_init)]):
+                    x = tf.identity(x)
+
+            # apply nonlinearity
+            if nonlinearity is not None:
+                x = nonlinearity(x)
+
+            return x
+
+    def log_sum_exp(self, x):
+        """ numerically stable log_sum_exp implementation that prevents overflow """
+        axis = len(x.get_shape()) - 1
+        m = tf.reduce_max(x, axis)
+        m2 = tf.reduce_max(x, axis, keepdims=True)
+        return m + tf.log(tf.reduce_sum(tf.exp(x - m2), axis))
+
+    def log_prob_from_logits(self, x):
+        """ numerically stable log_softmax implementation that prevents overflow """
+        axis = len(x.get_shape()) - 1
+        m = tf.reduce_max(x, axis, keepdims=True)
+        return x - m - tf.log(tf.reduce_sum(tf.exp(x - m), axis, keepdims=True))
+
+    def discretized_mix_logistic_loss(self, x, l, sum_all=True):
+        # xs = self.int_shape(x)  # original audio [n, 100000]
+        # ls = self.int_shape(l)  # generated audio [n, 100000, 256]
+        print(len(self.int_shape(l)))
+        xs = tf.shape(x)
+        ls = tf.shape(l)
+
+        print("xs=====================================================", xs)
+        print("ls=====================================================", ls)
+
+        nr_mix = int(self.int_shape(l)[-1] / 3)
+        logit_probs = l[:, :, :nr_mix]
+        l = l[:, :, nr_mix:]
+        means = l[:, :, :nr_mix]
+        log_scales = tf.maximum(l[:, :, nr_mix: 2 * nr_mix], -7.)
+        x = tf.reshape(x, [xs[0], xs[1]] + [1]) + tf.zeros([xs[0], xs[1]] + [nr_mix])
+
+        centered_x = x - means
+        inv_stdv = tf.exp(-log_scales)
+        plus_in = inv_stdv * (centered_x)
+        cdf_plus = tf.nn.sigmoid(plus_in)
+        min_in = inv_stdv * (centered_x)
+        cdf_min = tf.nn.sigmoid(min_in)
+        log_cdf_plus = plus_in - tf.nn.softplus(plus_in)
+        log_one_minus_cdf_min = -tf.nn.softplus(min_in)
+
+        cdf_delta = cdf_plus - cdf_min
+        mid_in = inv_stdv * centered_x
+        log_pdf_mid = mid_in - log_scales - 2. * tf.nn.softplus(mid_in)
+
+        print('cdf_delta:')
+        print('log_cdf_plus:')
+        print('log_one_minus_cdf_min:')
+        print('log_pdf_mid:')
+
+        log_probs = tf.where(x < -0.999, log_cdf_plus,
+                             tf.where(x > 0.999, log_one_minus_cdf_min,
+                                      tf.where(cdf_delta > 1e-5,
+                                               tf.log(tf.maximum(
+                                                   cdf_delta, 1e-12)),
+                                               log_pdf_mid - np.log(127.5))))
+
+        print("log_probs shape in model.py:", self.int_shape(log_probs))
+
+        log_probs = tf.reduce_sum(log_probs, 1) + self.log_prob_from_logits(logit_probs)
+        if sum_all:
+            return -tf.reduce_sum(self.log_sum_exp(log_probs))
+
+    def nin(self, x, num_units, **kwargs):
+        """ a network in network layer (1x1 CONV) """
+        v = x
+        s = self.int_shape(x)
+        print("x shape in nin is:", x.get_shape())
+        # s = x.get_shape()
+        x = tf.reshape(x, [tf.shape(x)[0], s[-1]])
+        x = self.dense(x, num_units, **kwargs)
+        return tf.reshape(x, [tf.shape(v)[0], 256, num_units])
