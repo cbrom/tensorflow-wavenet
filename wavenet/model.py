@@ -598,8 +598,9 @@ class WaveNetModel(object):
             raise NotImplementedError("Incremental generation does not "
                                       "support filter_width > 2.")
         if self.scalar_input:
-            encoded = tf.one_hot(waveform, self.quantization_channels)
-            encoded = tf.reshape(encoded, [-1, self.quantization_channels])
+            # encoded = tf.one_hot(waveform, self.quantization_channels)
+            print('waveform shape in predict_proba incremental:', self.int_shape(waveform))
+            encoded = tf.reshape(waveform, [-1, self.quantization_channels])
             gc_embedding = self._embed_gc(global_condition)
             raw_output = self._create_generator(encoded, gc_embedding)
             out = tf.reshape(raw_output, [-1, self.quantization_channels])
