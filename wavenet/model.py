@@ -599,7 +599,7 @@ class WaveNetModel(object):
                                       "support filter_width > 2.")
         if self.scalar_input:
             # encoded = tf.one_hot(waveform, self.quantization_channels)
-            print('waveform shape in predict_proba incremental:', self.int_shape(waveform))
+            print('waveform shape in predict_proba incremental:', type(waveform))
             encoded = tf.reshape(waveform, [-1, self.quantization_channels])
             gc_embedding = self._embed_gc(global_condition)
             raw_output = self._create_generator(encoded, gc_embedding)
